@@ -16,6 +16,7 @@ from email.utils import formataddr
 import datetime
 import time
 import random
+import uuid
 
 # --- Load environment variables ---
 load_dotenv()
@@ -102,6 +103,16 @@ def init_db():
         status TEXT,
         model_output TEXT,
         error TEXT,
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        session_id TEXT
+    )''')
+    # New table for sent log
+    c.execute('''CREATE TABLE IF NOT EXISTS sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        email TEXT,
+        subject TEXT,
+        body TEXT,
         sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     conn.commit()
@@ -119,7 +130,8 @@ progress_cache = {
     'message': '',
     'batch_total': 0,
     'batch_current': 0,
-    'wait_time': 0
+    'wait_time': 0,
+    'current_session_id': None
 }
 
 # --- Helper: Extract email from contact field ---
@@ -185,8 +197,54 @@ def generate_email_with_llama3(recipient):
         last_error = '[AI GENERATION ERROR: Placeholder like [Location] still present after retries.]'
     return last_result, last_error
 
+# --- Helper: Generate a new session ID ---
+def generate_session_id():
+    return str(uuid.uuid4())
+
+# --- API Endpoints ---
+@app.route('/api/upload', methods=['POST'])
+def upload_excel():
+    file = request.files.get('file')
+    if not file or not file.filename.endswith('.xlsx'):
+        return jsonify({'error': 'Invalid file type'}), 400
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(filepath)
+    df = pd.read_excel(filepath, engine='openpyxl')
+    recipients = []
+    seen_emails = set()
+    session_id = generate_session_id()
+    # Connect to DB to check for already sent/ready emails
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT email FROM emails WHERE status IN ("SENT", "Ready")')
+    already_in_db = set(row[0].lower() for row in c.fetchall() if row[0])
+    conn.close()
+    for _, row in df.iterrows():
+        r = {k.strip(): str(row.get(k, '')).strip() for k in df.columns}
+        r['Email'] = r.get('Email', extract_email(r.get('Contact', '')))
+        email = r['Email'].lower()
+        # Skip if email is missing, empty, nan, duplicate in file, or already in db
+        if not email or email == 'nan' or email in seen_emails or email in already_in_db:
+            continue
+        seen_emails.add(email)
+        r['session_id'] = session_id
+        recipients.append(r)
+    progress_cache['filename'] = file.filename
+    progress_cache['message'] = f"File '{file.filename}' uploaded. {len(recipients)} unique, valid emails will be generated and sent."
+    progress_cache['current_session_id'] = session_id
+    thread = threading.Thread(target=background_generate_emails, args=(recipients, session_id), daemon=True)
+    thread.start()
+    return jsonify({'status': 'started', 'total': len(recipients), 'filename': file.filename, 'message': progress_cache['message'], 'session_id': session_id})
+
+@app.route('/api/progress', methods=['GET'])
+def get_progress():
+    try:
+        return jsonify(progress_cache)
+    except Exception as e:
+        return jsonify({'total': 0, 'done': 0, 'emails': {}, 'status': 'error', 'error': str(e)})
+
 # --- Background Thread for AI Generation ---
-def background_generate_emails(recipients):
+def background_generate_emails(recipients, session_id):
     progress_cache['status'] = 'generating'
     progress_cache['done'] = 0
     progress_cache['total'] = len(recipients)
@@ -205,32 +263,52 @@ def background_generate_emails(recipients):
             'status': status,
             'error': error or ''
         }
-        # Save to DB
+        # Save to DB with session_id
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''INSERT INTO emails (name, email, business_type, status, model_output, error) VALUES (?, ?, ?, ?, ?, ?)''',
-                  (name, email, business, status, model_output, error or ''))
+        c.execute('''INSERT INTO emails (name, email, business_type, status, model_output, error, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                  (name, email, business, status, model_output, error or '', session_id))
         conn.commit()
         conn.close()
         progress_cache['done'] += 1
     progress_cache['status'] = 'done'
 
 # --- Email Sending Logic ---
-def send_all_emails(batch_size=10, delay_range=(8, 15)):
+@app.route('/api/send', methods=['POST'])
+def send_emails():
+    data = request.get_json(silent=True) or {}
+    batch_size = int(data.get('batch_size', 10))
+    delay_min = int(data.get('delay_min', 8))
+    delay_max = int(data.get('delay_max', 15))
+    session_id = data.get('session_id') or progress_cache.get('current_session_id')
+    if not session_id:
+        return jsonify({'error': 'No session_id provided or found.'}), 400
+    thread = threading.Thread(target=send_all_emails, args=(batch_size, (delay_min, delay_max), session_id), daemon=True)
+    thread.start()
+    return jsonify({'status': 'sending', 'batch_size': batch_size, 'delay_range': [delay_min, delay_max], 'session_id': session_id})
+
+def send_all_emails(batch_size=10, delay_range=(8, 15), session_id=None):
     progress_cache['status'] = 'sending'
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "Ready"')
+    if session_id:
+        c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "Ready" AND session_id = ?', (session_id,))
+    else:
+        c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "Ready"')
     rows = c.fetchall()
     total = len(rows)
     batches = [rows[i:i+batch_size] for i in range(0, total, batch_size)]
     progress_cache['batch_total'] = len(batches)
     progress_cache['batch_current'] = 0
     import re  # For post-processing
+    sent_emails = set()
     for batch_num, batch in enumerate(batches, 1):
         progress_cache['batch_current'] = batch_num
         for row in batch:
             name, email, business, model_output = row
+            if email in sent_emails:
+                continue  # Deduplicate within session
+            sent_emails.add(email)
             try:
                 lines = model_output.splitlines()
                 subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
@@ -250,8 +328,10 @@ def send_all_emails(batch_size=10, delay_range=(8, 15)):
                     server.login(SMTP_USER, SMTP_PASSWORD)
                     server.sendmail(SMTP_USER, [email], msg.as_string())
                 status, error = 'SENT', ''
+                # Log sent email after successful send
+                c.execute('''INSERT INTO sent_log (name, email, subject, body) VALUES (?, ?, ?, ?)''', (name, email, subject, body))
+                conn.commit()
             except Exception as e:
-                # If rate limit or SMTP error, pause and retry after longer delay
                 if 'rate' in str(e).lower() or 'limit' in str(e).lower():
                     progress_cache['status'] = 'rate_limited_waiting'
                     time.sleep(60)
@@ -331,47 +411,69 @@ def retry_failed_emails(batch_size=10, delay_range=(8, 15)):
     progress_cache['wait_time'] = 0
     return retried
 
-# --- API Endpoints ---
-@app.route('/api/upload', methods=['POST'])
-def upload_excel():
-    file = request.files.get('file')
-    if not file or not file.filename.endswith('.xlsx'):
-        return jsonify({'error': 'Invalid file type'}), 400
-    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(filepath)
-    df = pd.read_excel(filepath, engine='openpyxl')
-    recipients = []
-    for _, row in df.iterrows():
-        r = {k.strip(): str(row.get(k, '')).strip() for k in df.columns}
-        # Standardize keys for downstream logic
-        r['Email'] = r.get('Email', extract_email(r.get('Contact', '')))
-        # Skip if email is missing, empty, or 'nan'
-        if not r['Email'] or r['Email'].lower() == 'nan':
-            continue
-        recipients.append(r)
-    progress_cache['filename'] = file.filename
-    progress_cache['message'] = f"File '{file.filename}' uploaded. Generating emails..."
-    thread = threading.Thread(target=background_generate_emails, args=(recipients,), daemon=True)
-    thread.start()
-    return jsonify({'status': 'started', 'total': len(recipients), 'filename': file.filename, 'message': progress_cache['message']})
-
-@app.route('/api/progress', methods=['GET'])
-def get_progress():
-    try:
-        return jsonify(progress_cache)
-    except Exception as e:
-        return jsonify({'total': 0, 'done': 0, 'emails': {}, 'status': 'error', 'error': str(e)})
-
-@app.route('/api/send', methods=['POST'])
-def send_emails():
+# --- Resend Endpoint ---
+@app.route('/api/resend', methods=['POST'])
+def resend_emails():
     data = request.get_json(silent=True) or {}
     batch_size = int(data.get('batch_size', 10))
     delay_min = int(data.get('delay_min', 8))
     delay_max = int(data.get('delay_max', 15))
-    thread = threading.Thread(target=send_all_emails, args=(batch_size, (delay_min, delay_max)), daemon=True)
+    resend_to = data.get('emails')  # List of emails to resend to
+    if not resend_to:
+        return jsonify({'error': 'No emails provided for resend.'}), 400
+    thread = threading.Thread(target=send_resend_emails, args=(batch_size, (delay_min, delay_max), resend_to), daemon=True)
     thread.start()
-    return jsonify({'status': 'sending', 'batch_size': batch_size, 'delay_range': [delay_min, delay_max]})
+    return jsonify({'status': 'resending', 'batch_size': batch_size, 'delay_range': [delay_min, delay_max], 'emails': resend_to})
 
+def send_resend_emails(batch_size, delay_range, resend_to):
+    progress_cache['status'] = 'resending'
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    placeholders = ','.join('?' for _ in resend_to)
+    c.execute(f'SELECT name, email, business_type, model_output FROM emails WHERE email IN ({placeholders}) AND status = "SENT"', tuple(resend_to))
+    rows = c.fetchall()
+    total = len(rows)
+    batches = [rows[i:i+batch_size] for i in range(0, total, batch_size)]
+    progress_cache['batch_total'] = len(batches)
+    progress_cache['batch_current'] = 0
+    import re
+    for batch_num, batch in enumerate(batches, 1):
+        progress_cache['batch_current'] = batch_num
+        for row in batch:
+            name, email, business, model_output = row
+            try:
+                lines = model_output.splitlines()
+                subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
+                subject = subject_line.replace('**', '').replace('Subject:', '').strip()
+                body_start = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('hi') or l.strip().lower().startswith('hello')), 1)
+                body = '\n'.join(lines[body_start:]).lstrip('\n')
+                body = re.sub(r'\bin\s*,', '', body)
+                body = re.sub(r'\bin\s+$', '', body)
+                body = re.sub(r'(with:)\s*', r'\1\n', body)
+                msg = MIMEText(body, 'plain')
+                msg['Subject'] = subject
+                msg['From'] = formataddr(("The PixelSolve Team", SMTP_USER))
+                msg['To'] = email
+                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+                    server.login(SMTP_USER, SMTP_PASSWORD)
+                    server.sendmail(SMTP_USER, [email], msg.as_string())
+                status, error = 'RESENT', ''
+            except Exception as e:
+                status, error = 'FAILED', str(e)
+            c.execute('UPDATE emails SET status=?, error=? WHERE email=? AND model_output=?', (status, error, email, model_output))
+            conn.commit()
+        if batch_num < len(batches):
+            progress_cache['status'] = f'waiting_batch_{batch_num}'
+            wait_time = random.randint(*delay_range)
+            progress_cache['wait_time'] = wait_time
+            time.sleep(wait_time)
+            progress_cache['status'] = 'resending'
+    conn.close()
+    progress_cache['status'] = 'done'
+    progress_cache['batch_current'] = progress_cache['batch_total']
+    progress_cache['wait_time'] = 0
+
+# --- API Endpoints ---
 @app.route('/api/retry_failed', methods=['POST'])
 def retry_failed_emails_api():
     data = request.get_json(silent=True) or {}
@@ -401,25 +503,24 @@ def get_stats():
     c = conn.cursor()
     # Total sent today
     today = datetime.datetime.now().strftime('%Y-%m-%d')
-    c.execute("SELECT COUNT(*) FROM emails WHERE status='SENT' AND DATE(sent_at)=?", (today,))
+    c.execute("SELECT COUNT(*) FROM sent_log WHERE DATE(sent_at)=?", (today,))
     total_sent_today = c.fetchone()[0]
     # Total sent all time
-    c.execute("SELECT COUNT(*) FROM emails WHERE status='SENT'")
+    c.execute("SELECT COUNT(*) FROM sent_log")
     total_sent_all = c.fetchone()[0]
     # Breakdown by country (top 5)
-    c.execute("SELECT model_output FROM emails WHERE status='SENT'")
+    c.execute("SELECT body FROM sent_log")
     country_counts = {}
     business_type_counts = {}
     top_recipients_by_country = []
     for row in c.fetchall():
-        model_output = row[0]
-        # Try to extract country and business type from model_output (fallback: unknown)
+        body = row[0]
+        # Try to extract country and business type from body (fallback: unknown)
         country = 'Unknown'
         business_type = 'Unknown'
-        lines = model_output.split('\n')
+        lines = body.split('\n')
         for l in lines:
             if 'café in' in l or 'coffee shop in' in l:
-                # e.g., 'I recently came across your café in Austin, USA ...'
                 parts = l.split(' in ')
                 if len(parts) > 1:
                     loc = parts[1].split(' and')[0].split(',')
@@ -440,11 +541,11 @@ def get_stats():
     countries = sorted(country_counts.items(), key=lambda x: -x[1])[:5]
     business_types = sorted(business_type_counts.items(), key=lambda x: -x[1])[:5]
     # Top recipients by country (first 5 unique)
-    c.execute("SELECT email, model_output FROM emails WHERE status='SENT'")
+    c.execute("SELECT email, body FROM sent_log")
     seen = set()
-    for email, model_output in c.fetchall():
+    for email, body in c.fetchall():
         country = 'Unknown'
-        lines = model_output.split('\n')
+        lines = body.split('\n')
         for l in lines:
             if 'café in' in l or 'coffee shop in' in l:
                 parts = l.split(' in ')

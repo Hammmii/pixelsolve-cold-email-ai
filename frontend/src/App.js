@@ -92,6 +92,7 @@ function App() {
   const [batchSize, setBatchSize] = useState(10);
   const [delayMin, setDelayMin] = useState(8);
   const [delayMax, setDelayMax] = useState(15);
+  const [sessionId, setSessionId] = useState(null); // NEW: store session_id
 
   // Poll progress
   useEffect(() => {
@@ -131,6 +132,7 @@ function App() {
         setUploading(false);
         setUploadMsg(data.message || 'File uploaded. Generating emails...');
         setProgress({ ...progress, status: 'generating', filename: data.filename, message: data.message });
+        setSessionId(data.session_id || null); // NEW: store session_id
         fetchProgress();
       })
       .catch(() => setUploading(false));
@@ -146,7 +148,7 @@ function App() {
     fetch(`${API_URL}/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batch_size: batchSize, delay_min: delayMin, delay_max: delayMax })
+      body: JSON.stringify({ batch_size: batchSize, delay_min: delayMin, delay_max: delayMax, session_id: sessionId }) // NEW: include session_id
     })
       .then(res => res.json())
       .then(() => {
