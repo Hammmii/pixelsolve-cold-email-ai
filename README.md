@@ -11,6 +11,12 @@ This project automates sending highly personalized, business-specific cold email
 - **No per-email cost, no cloud AI required** (runs locally)
 - **Responsive, beautiful UI**
 
+## Important: What Not to Commit
+- Do **not** commit your `.env` file (contains secrets)
+- Do **not** commit any Excel files with leads/recipients (`*.xlsx`)
+- Do **not** commit database files (e.g., `email_log.db`, `sent_log.db`)
+- The provided `.gitignore` already handles these for you!
+
 ## Setup
 
 ### 1. Clone the Repo
@@ -23,6 +29,14 @@ cd <repo-folder>
 ```bash
 pip install -r requirements.txt
 ```
+
+#### requirements.txt includes:
+- Flask
+- flask_cors
+- pandas
+- python-dotenv
+- requests
+- openpyxl
 
 ### 3. Install Ollama (Local LLM)
 - [Download and install Ollama](https://ollama.com/) for Mac/Windows/Linux:

@@ -14,6 +14,8 @@ import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
 import datetime
+import time
+import random
 
 # --- Load environment variables ---
 load_dotenv()
@@ -114,7 +116,10 @@ progress_cache = {
     'status': 'idle',
     'error': '',
     'filename': '',
-    'message': ''
+    'message': '',
+    'batch_total': 0,
+    'batch_current': 0,
+    'wait_time': 0
 }
 
 # --- Helper: Extract email from contact field ---
@@ -143,17 +148,42 @@ Personalized Hook / Observation: {recipient.get('Personalized Hook / Observation
 
 # --- AI Email Generation ---
 def generate_email_with_llama3(recipient):
+    def contains_placeholder(text):
+        import re
+        # Check for [Location], [LOCATION], [City], [Country] (case-insensitive)
+        return bool(re.search(r'\[(location|city|country)\]', text, re.IGNORECASE))
+
     prompt = build_prompt(recipient)
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={'model': LLAMA3_MODEL, 'prompt': prompt, 'stream': False},
-            timeout=90
-        )
-        result = response.json().get('response', '')
-        return result, None
-    except Exception as e:
-        return '', f"[AI GENERATION ERROR: {e}]"
+    max_attempts = 3
+    attempt = 0
+    extra_instruction = ("\nIMPORTANT: If you are about to use a placeholder like [Location], [LOCATION], [City], or [Country], instead use the real location provided in the data, or omit the location if not available. Never output any placeholder in the email. Regenerate the email accordingly.\n")
+    last_result = ''
+    last_error = None
+    while attempt < max_attempts:
+        try:
+            this_prompt = prompt
+            if attempt > 0:
+                # Add extra instruction for subsequent attempts
+                this_prompt = PROMPT_TEMPLATE + "\n" + extra_instruction + build_prompt(recipient).split(PROMPT_TEMPLATE, 1)[-1]
+            response = requests.post(
+                OLLAMA_URL,
+                json={'model': LLAMA3_MODEL, 'prompt': this_prompt, 'stream': False},
+                timeout=90
+            )
+            result = response.json().get('response', '')
+            last_result = result
+            last_error = None
+            if not contains_placeholder(result):
+                return result, None
+        except Exception as e:
+            last_result = ''
+            last_error = f"[AI GENERATION ERROR: {e}]"
+            break
+        attempt += 1
+    # If we reach here, either error or still contains placeholder after max attempts
+    if last_result and contains_placeholder(last_result):
+        last_error = '[AI GENERATION ERROR: Placeholder like [Location] still present after retries.]'
+    return last_result, last_error
 
 # --- Background Thread for AI Generation ---
 def background_generate_emails(recipients):
@@ -186,40 +216,120 @@ def background_generate_emails(recipients):
     progress_cache['status'] = 'done'
 
 # --- Email Sending Logic ---
-def send_all_emails():
+def send_all_emails(batch_size=10, delay_range=(8, 15)):
     progress_cache['status'] = 'sending'
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "Ready"')
     rows = c.fetchall()
-    for row in rows:
-        name, email, business, model_output = row
-        try:
-            lines = model_output.splitlines()
-            # Find the subject line (first line starting with 'Subject:')
-            subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
-            subject = subject_line.replace('**', '').replace('Subject:', '').strip()
-            # Find the first line that starts with 'Hi' or 'Hello' (case-insensitive)
-            body_start = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('hi') or l.strip().lower().startswith('hello')), 1)
-            body = '\n'.join(lines[body_start:]).lstrip('\n')
-            msg = MIMEText(body, 'plain')
-            msg['Subject'] = subject
-            msg['From'] = formataddr(("The PixelSolve Team", SMTP_USER))
-            msg['To'] = email
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_USER, [email], msg.as_string())
-            status, error = 'SENT', ''
-        except Exception as e:
-            status, error = 'FAILED', str(e)
-        c.execute('UPDATE emails SET status=?, error=? WHERE email=? AND model_output=?', (status, error, email, model_output))
-        conn.commit()
-        # Update in-memory cache
-        if email in progress_cache['emails']:
-            progress_cache['emails'][email]['status'] = status
-            progress_cache['emails'][email]['error'] = error
+    total = len(rows)
+    batches = [rows[i:i+batch_size] for i in range(0, total, batch_size)]
+    progress_cache['batch_total'] = len(batches)
+    progress_cache['batch_current'] = 0
+    import re  # For post-processing
+    for batch_num, batch in enumerate(batches, 1):
+        progress_cache['batch_current'] = batch_num
+        for row in batch:
+            name, email, business, model_output = row
+            try:
+                lines = model_output.splitlines()
+                subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
+                subject = subject_line.replace('**', '').replace('Subject:', '').strip()
+                body_start = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('hi') or l.strip().lower().startswith('hello')), 1)
+                body = '\n'.join(lines[body_start:]).lstrip('\n')
+                # Post-process: remove 'in ,' or 'in  ' (with nothing after 'in')
+                body = re.sub(r'\bin\s*,', '', body)
+                body = re.sub(r'\bin\s+$', '', body)
+                # Post-process: ensure 'with:' is always followed by a newline
+                body = re.sub(r'(with:)\s*', r'\1\n', body)
+                msg = MIMEText(body, 'plain')
+                msg['Subject'] = subject
+                msg['From'] = formataddr(("The PixelSolve Team", SMTP_USER))
+                msg['To'] = email
+                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+                    server.login(SMTP_USER, SMTP_PASSWORD)
+                    server.sendmail(SMTP_USER, [email], msg.as_string())
+                status, error = 'SENT', ''
+            except Exception as e:
+                # If rate limit or SMTP error, pause and retry after longer delay
+                if 'rate' in str(e).lower() or 'limit' in str(e).lower():
+                    progress_cache['status'] = 'rate_limited_waiting'
+                    time.sleep(60)
+                    continue
+                status, error = 'FAILED', str(e)
+            c.execute('UPDATE emails SET status=?, error=? WHERE email=? AND model_output=?', (status, error, email, model_output))
+            conn.commit()
+            if email in progress_cache['emails']:
+                progress_cache['emails'][email]['status'] = status
+                progress_cache['emails'][email]['error'] = error
+        if batch_num < len(batches):
+            progress_cache['status'] = f'waiting_batch_{batch_num}'
+            wait_time = random.randint(*delay_range)
+            progress_cache['wait_time'] = wait_time
+            time.sleep(wait_time)
+            progress_cache['status'] = 'sending'
     conn.close()
     progress_cache['status'] = 'done'
+    progress_cache['batch_current'] = progress_cache['batch_total']
+    progress_cache['wait_time'] = 0
+
+def retry_failed_emails(batch_size=10, delay_range=(8, 15)):
+    progress_cache['status'] = 'retrying'
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "FAILED"')
+    rows = c.fetchall()
+    total = len(rows)
+    batches = [rows[i:i+batch_size] for i in range(0, total, batch_size)]
+    progress_cache['batch_total'] = len(batches)
+    progress_cache['batch_current'] = 0
+    retried = []
+    import re  # For post-processing
+    for batch_num, batch in enumerate(batches, 1):
+        progress_cache['batch_current'] = batch_num
+        for row in batch:
+            name, email, business, model_output = row
+            try:
+                lines = model_output.splitlines()
+                subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
+                subject = subject_line.replace('**', '').replace('Subject:', '').strip()
+                body_start = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('hi') or l.strip().lower().startswith('hello')), 1)
+                body = '\n'.join(lines[body_start:]).lstrip('\n')
+                # Post-process: remove 'in ,' or 'in  ' (with nothing after 'in')
+                body = re.sub(r'\bin\s*,', '', body)
+                body = re.sub(r'\bin\s+$', '', body)
+                # Post-process: ensure 'with:' is always followed by a newline
+                body = re.sub(r'(with:)\s*', r'\1\n', body)
+                msg = MIMEText(body, 'plain')
+                msg['Subject'] = subject
+                msg['From'] = formataddr(("The PixelSolve Team", SMTP_USER))
+                msg['To'] = email
+                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+                    server.login(SMTP_USER, SMTP_PASSWORD)
+                    server.sendmail(SMTP_USER, [email], msg.as_string())
+                status, error = 'SENT', ''
+            except Exception as e:
+                if 'rate' in str(e).lower() or 'limit' in str(e).lower():
+                    progress_cache['status'] = 'rate_limited_waiting'
+                    time.sleep(60)
+                    continue
+                status, error = 'FAILED', str(e)
+            c.execute('UPDATE emails SET status=?, error=? WHERE email=? AND model_output=?', (status, error, email, model_output))
+            conn.commit()
+            if email in progress_cache['emails']:
+                progress_cache['emails'][email]['status'] = status
+                progress_cache['emails'][email]['error'] = error
+        if batch_num < len(batches):
+            progress_cache['status'] = f'waiting_batch_{batch_num}'
+            wait_time = random.randint(*delay_range)
+            progress_cache['wait_time'] = wait_time
+            time.sleep(wait_time)
+            progress_cache['status'] = 'retrying'
+    conn.close()
+    progress_cache['status'] = 'done'
+    progress_cache['batch_current'] = progress_cache['batch_total']
+    progress_cache['wait_time'] = 0
+    return retried
 
 # --- API Endpoints ---
 @app.route('/api/upload', methods=['POST'])
@@ -235,6 +345,9 @@ def upload_excel():
         r = {k.strip(): str(row.get(k, '')).strip() for k in df.columns}
         # Standardize keys for downstream logic
         r['Email'] = r.get('Email', extract_email(r.get('Contact', '')))
+        # Skip if email is missing, empty, or 'nan'
+        if not r['Email'] or r['Email'].lower() == 'nan':
+            continue
         recipients.append(r)
     progress_cache['filename'] = file.filename
     progress_cache['message'] = f"File '{file.filename}' uploaded. Generating emails..."
@@ -251,9 +364,26 @@ def get_progress():
 
 @app.route('/api/send', methods=['POST'])
 def send_emails():
-    thread = threading.Thread(target=send_all_emails, daemon=True)
+    data = request.get_json(silent=True) or {}
+    batch_size = int(data.get('batch_size', 10))
+    delay_min = int(data.get('delay_min', 8))
+    delay_max = int(data.get('delay_max', 15))
+    thread = threading.Thread(target=send_all_emails, args=(batch_size, (delay_min, delay_max)), daemon=True)
     thread.start()
-    return jsonify({'status': 'sending'})
+    return jsonify({'status': 'sending', 'batch_size': batch_size, 'delay_range': [delay_min, delay_max]})
+
+@app.route('/api/retry_failed', methods=['POST'])
+def retry_failed_emails_api():
+    data = request.get_json(silent=True) or {}
+    batch_size = int(data.get('batch_size', 10))
+    delay_min = int(data.get('delay_min', 8))
+    delay_max = int(data.get('delay_max', 15))
+    def run():
+        retried = retry_failed_emails(batch_size, (delay_min, delay_max))
+        return retried
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return jsonify({'status': 'retrying', 'batch_size': batch_size, 'delay_range': [delay_min, delay_max]})
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
@@ -264,42 +394,6 @@ def get_logs():
     conn.close()
     logs = [dict(zip(['name','email','business_type','status','model_output','error','sent_at'], row)) for row in rows]
     return jsonify({'logs': logs})
-
-@app.route('/api/retry_failed', methods=['POST'])
-def retry_failed_emails():
-    progress_cache['status'] = 'retrying'
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT name, email, business_type, model_output FROM emails WHERE status = "FAILED"')
-    rows = c.fetchall()
-    retried = []
-    for row in rows:
-        name, email, business, model_output = row
-        try:
-            lines = model_output.splitlines()
-            subject_line = next((l for l in lines if l.strip().lower().startswith('subject:')), lines[0] if lines else 'PixelSolve Cold Email')
-            subject = subject_line.replace('**', '').replace('Subject:', '').strip()
-            body_start = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('hi') or l.strip().lower().startswith('hello')), 1)
-            body = '\n'.join(lines[body_start:]).lstrip('\n')
-            msg = MIMEText(body, 'plain')
-            msg['Subject'] = subject
-            msg['From'] = formataddr(("The PixelSolve Team", SMTP_USER))
-            msg['To'] = email
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_USER, [email], msg.as_string())
-            status, error = 'SENT', ''
-        except Exception as e:
-            status, error = 'FAILED', str(e)
-        c.execute('UPDATE emails SET status=?, error=? WHERE email=? AND model_output=?', (status, error, email, model_output))
-        conn.commit()
-        retried.append(email)
-        if email in progress_cache['emails']:
-            progress_cache['emails'][email]['status'] = status
-            progress_cache['emails'][email]['error'] = error
-    conn.close()
-    progress_cache['status'] = 'done'
-    return jsonify({'retried': len(retried), 'emails': retried})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():

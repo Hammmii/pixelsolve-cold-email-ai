@@ -1,4 +1,7 @@
 Flask
-Jinja2
+flask_cors
 pandas
-python-dotenv 
+python-dotenv
+requests
+openpyxl
+# smtplib is part of Python standard library 

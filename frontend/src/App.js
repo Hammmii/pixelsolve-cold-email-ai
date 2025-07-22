@@ -89,6 +89,9 @@ function App() {
   const intervalRef = useRef();
   const [uploadMsg, setUploadMsg] = useState('');
   const [showStats, setShowStats] = useState(false);
+  const [batchSize, setBatchSize] = useState(10);
+  const [delayMin, setDelayMin] = useState(8);
+  const [delayMax, setDelayMax] = useState(15);
 
   // Poll progress
   useEffect(() => {
@@ -140,7 +143,11 @@ function App() {
 
   function handleSend() {
     setSending(true);
-    fetch(`${API_URL}/send`, { method: 'POST' })
+    fetch(`${API_URL}/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_size: batchSize, delay_min: delayMin, delay_max: delayMax })
+    })
       .then(res => res.json())
       .then(() => {
         setSending(false);
@@ -151,7 +158,11 @@ function App() {
   }
 
   function handleRetryFailed() {
-    fetch(`${API_URL}/retry_failed`, { method: 'POST' })
+    fetch(`${API_URL}/retry_failed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_size: batchSize, delay_min: delayMin, delay_max: delayMax })
+    })
       .then(res => res.json())
       .then(() => {
         fetchProgress();
@@ -182,6 +193,21 @@ function App() {
   else if (progress.status === 'done') statusMsg = 'Done!';
   else if (progress.status === 'idle') statusMsg = 'Idle.';
   if (progress.error) statusMsg = `Error: ${progress.error}`;
+
+  // Batch progress and status
+  let batchMsg = '';
+  if (progress.batch_total > 0) {
+    batchMsg = `Batch ${progress.batch_current} of ${progress.batch_total}`;
+    if (progress.wait_time > 0 && progress.status && progress.status.startsWith('waiting_batch_')) {
+      batchMsg += ` — Waiting ${progress.wait_time}s to avoid spam/rate limits...`;
+    }
+  }
+  let estTime = '';
+  if (progress.batch_total > 0 && progress.batch_current < progress.batch_total) {
+    const batchesLeft = progress.batch_total - progress.batch_current;
+    const avgDelay = ((delayMin + delayMax) / 2) || 10;
+    estTime = `Est. time left: ~${Math.ceil(batchesLeft * avgDelay)}s`;
+  }
 
   if (showStats) return <StatsPage onBack={() => setShowStats(false)} />;
 
@@ -221,6 +247,16 @@ function App() {
             </div>
           </div>
           <div className="status-msg">{statusMsg}</div>
+          {batchMsg && <div className="batch-msg">{batchMsg} {estTime && <span style={{ color: '#a3bffa', marginLeft: 8 }}>{estTime}</span>}</div>}
+        </div>
+        <div className="batch-controls-row">
+          <label style={{ color: '#a3bffa', marginRight: 8 }}>Batch size:</label>
+          <input type="number" min={1} max={100} value={batchSize} onChange={e => setBatchSize(Number(e.target.value))} style={{ width: 60, marginRight: 16 }} />
+          <label style={{ color: '#a3bffa', marginRight: 8 }}>Delay (sec):</label>
+          <input type="number" min={1} max={60} value={delayMin} onChange={e => setDelayMin(Number(e.target.value))} style={{ width: 50, marginRight: 4 }} />
+          <span style={{ color: '#a3bffa', marginRight: 4 }}>-</span>
+          <input type="number" min={1} max={120} value={delayMax} onChange={e => setDelayMax(Number(e.target.value))} style={{ width: 50, marginRight: 8 }} />
+          <span style={{ color: '#a3bffa' }}>(random per batch)</span>
         </div>
         <div className="table-responsive">
           <table className="main-table">
